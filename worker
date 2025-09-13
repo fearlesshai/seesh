@@ -1,23 +1,20 @@
-// worker.js (ESM, Termux-ready)
-// Stalker-Portal to M3U generator (Hardened + 429 backoff)
-
-import fetch from 'node-fetch';
+// ----------------------- Imports -----------------------
 import http from 'http';
-import { URL } from 'url';
+import fetch from 'node-fetch';
 import crypto from 'crypto';
 
-// ==================== CONFIG ====================
+// ----------------------- CONFIG -----------------------
 const config = {
     host: 'iptv.initv.de',
     mac_address: '00:1A:79:61:2D:BB',
-    serial_number: '56EB7FA68778',
+    serial_number: '56EB7FA68778C',
     device_id: '76C8FF8575442448A774C2E59098C02D0C209486B0FA9064CB193B7DC28789ED',
     device_id_2: '76C8FF8575442448A774C2E59098C02D0C209486B0FA9064CB193B7DC28789ED',
     stb_type: 'MAG250',
     api_signature: '263',
 };
 
-// ==================== HELPERS ====================
+// ----------------------- Helpers -----------------------
 function logDebug(msg) {
     console.log(`${new Date().toISOString()} - ${msg}`);
 }
@@ -29,33 +26,28 @@ function randomHex(len = 16) {
     return out;
 }
 
-function md5Hex(str) {
+async function hashMD5(str) {
     return crypto.createHash('md5').update(str).digest('hex');
 }
 
-async function safeJSONFromResponse(response, label = '') {
-    try {
-        const text = await response.text();
-        logDebug(`${label} response (first 500 chars): ${text.substring(0, 500)}`);
+// ----------------------- Fetch with 429 Backoff -----------------------
+async function fetchWithBackoff(url, options = {}, maxRetries = 5, startDelay = 1000) {
+    let delay = startDelay;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            return JSON.parse(text);
-        } catch (parseErr) {
-            logDebug(`${label} JSON parse error: ${parseErr.message}`);
-            return {};
+            const resp = await fetch(url, options);
+            if (resp.status !== 429) return resp;
+            logDebug(`429 from ${url} – retrying in ${delay}ms (attempt ${attempt})`);
+        } catch (e) {
+            logDebug(`Fetch error: ${e.message} (attempt ${attempt})`);
         }
-    } catch (e) {
-        logDebug(`${label} read/text error: ${e.message}`);
-        return {};
+        await new Promise(r => setTimeout(r, delay));
+        delay *= 2;
     }
+    return fetch(url, options);
 }
 
-function normalizeConfig() {
-    if (config.mac_address) config.mac_address = config.mac_address.trim();
-    if (!config.serial_number) config.serial_number = randomHex(12).toUpperCase();
-    if (!config.device_id) config.device_id = randomHex(32).toUpperCase();
-    if (!config.device_id_2) config.device_id_2 = randomHex(32).toUpperCase();
-}
-
+// ----------------------- Headers -----------------------
 function getHeaders(token = '') {
     const headers = {
         'Cookie': `mac=${config.mac_address}; stb_lang=en; timezone=GMT`,
@@ -67,155 +59,126 @@ function getHeaders(token = '') {
     return headers;
 }
 
-async function fetchWithBackoff(url, options = {}, maxRetries = 5, startDelayMs = 1000) {
-    let delay = startDelayMs;
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            const resp = await fetch(url, options);
-            if (resp.status !== 429) return resp;
-            logDebug(`429 from ${url} – retrying in ${delay}ms (attempt ${attempt})`);
-        } catch (e) {
-            logDebug(`fetch error for ${url}: ${e.message} (attempt ${attempt})`);
-        }
-        await new Promise(r => setTimeout(r, delay));
-        delay *= 2;
-    }
-    return fetch(url, options);
-}
+// ----------------------- Global Cache -----------------------
+let cachedToken = '';
+let cachedProfile = {};
+let cachedAccount = {};
+let cachedChannels = [];
+let cachedGenres = [];
 
-// ==================== HARDWARE & TOKEN ====================
-async function generateHardwareVersions() {
-    normalizeConfig();
-    config.hw_version = '1.7-BD-' + md5Hex(config.mac_address).substring(0, 2).toUpperCase();
-    config.hw_version_2 = md5Hex((config.serial_number + config.mac_address).toLowerCase());
-    logDebug(`hw_version: ${config.hw_version}, hw_version_2: ${config.hw_version_2}`);
+// ----------------------- Token Generation -----------------------
+async function generateHardware() {
+    config.hw_version = '1.7-BD-' + (await hashMD5(config.mac_address)).substring(0, 2).toUpperCase();
+    config.hw_version_2 = await hashMD5((config.serial_number + config.mac_address).toLowerCase());
 }
 
 async function getToken() {
     const url = `http://${config.host}/stalker_portal/server/load.php?type=stb&action=handshake&token=&JsHttpRequest=1-xml`;
-    try {
-        logDebug(`Fetching token from ${url}`);
-        const response = await fetchWithBackoff(url, { headers: getHeaders() });
-        if (!response.ok) return '';
-        const data = await safeJSONFromResponse(response, 'getToken');
-        return data.js?.token || '';
-    } catch (e) { logDebug(`Error in getToken: ${e.message}`); return ''; }
+    const resp = await fetchWithBackoff(url, { headers: getHeaders() });
+    const data = await resp.json().catch(() => ({}));
+    return data.js?.token || '';
 }
 
 async function auth(token) {
-    const metrics = { mac: config.mac_address, model: config.stb_type, type: 'STB', uid: '', sn: config.serial_number, random: '' };
-    const metricsEncoded = encodeURIComponent(JSON.stringify(metrics));
-    const url = `http://${config.host}/stalker_portal/server/load.php?type=stb&action=get_profile&hd=1&num_banks=2&sn=${config.serial_number}&stb_type=${config.stb_type}&device_id=${config.device_id}&device_id2=${config.device_id_2}&hw_version=${encodeURIComponent(config.hw_version)}&hw_version_2=${config.hw_version_2}&JsHttpRequest=1-xml&metrics=${metricsEncoded}`;
-    try {
-        const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
-        if (!resp.ok) return {};
-        const data = await safeJSONFromResponse(resp, 'auth');
-        return data.js || {};
-    } catch (e) { logDebug(`Error in auth: ${e.message}`); return {}; }
+    const metrics = encodeURIComponent(JSON.stringify({
+        mac: config.mac_address, model: config.stb_type, type: 'STB', uid: '', sn: config.serial_number, random: ''
+    }));
+    const url = `http://${config.host}/stalker_portal/server/load.php?type=stb&action=get_profile&num_banks=2&sn=${config.serial_number}&stb_type=${config.stb_type}&device_id=${config.device_id}&device_id2=${config.device_id_2}&metrics=${metrics}&hw_version=${encodeURIComponent(config.hw_version)}&hw_version_2=${config.hw_version_2}&api_signature=${config.api_signature}&JsHttpRequest=1-xml`;
+    const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
+    const data = await resp.json().catch(() => ({}));
+    return data.js || {};
 }
 
 async function handShake(token) {
     const url = `http://${config.host}/stalker_portal/server/load.php?type=stb&action=handshake&token=${token}&JsHttpRequest=1-xml`;
-    try {
-        const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
-        if (!resp.ok) return '';
-        const data = await safeJSONFromResponse(resp, 'handShake');
-        return data.js?.token || '';
-    } catch (e) { logDebug(`Error in handShake: ${e.message}`); return ''; }
+    const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
+    const data = await resp.json().catch(() => ({}));
+    return data.js?.token || '';
 }
 
 async function getAccountInfo(token) {
     const url = `http://${config.host}/stalker_portal/server/load.php?type=account_info&action=get_main_info&JsHttpRequest=1-xml`;
-    try {
-        const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
-        if (!resp.ok) return {};
-        const data = await safeJSONFromResponse(resp, 'getAccountInfo');
-        return data.js || {};
-    } catch (e) { logDebug(`Error in getAccountInfo: ${e.message}`); return {}; }
+    const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
+    const data = await resp.json().catch(() => ({}));
+    return data.js || {};
 }
 
 async function getGenres(token) {
     const url = `http://${config.host}/stalker_portal/server/load.php?type=itv&action=get_genres&JsHttpRequest=1-xml`;
-    try {
-        const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
-        if (!resp.ok) return [];
-        const data = await safeJSONFromResponse(resp, 'getGenres');
-        return data.js || [];
-    } catch (e) { logDebug(`Error in getGenres: ${e.message}`); return []; }
+    const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
+    const data = await resp.json().catch(() => ([]));
+    return data.js || [];
 }
 
-async function getStreamURL(id, token) {
-    const cmdPayload = encodeURIComponent(`ffrt http://localhost/ch/${id}`);
-    const url = `http://${config.host}/stalker_portal/server/load.php?type=itv&action=create_link&cmd=${cmdPayload}&JsHttpRequest=1-xml`;
-    try {
-        const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
-        if (!resp.ok) return '';
-        const data = await safeJSONFromResponse(resp, 'getStreamURL');
-        let stream = '';
-        if (data.js) stream = data.js.cmd || (Array.isArray(data.js) ? data.js[0]?.cmd || '' : '');
-        return stream.replace(/^ffrt\s+/i, '').trim();
-    } catch (e) { logDebug(`Error in getStreamURL: ${e.message}`); return ''; }
+async function getChannels(token) {
+    const url = `http://${config.host}/stalker_portal/server/load.php?type=itv&action=get_all_channels&JsHttpRequest=1-xml`;
+    const resp = await fetchWithBackoff(url, { headers: getHeaders(token) });
+    const data = await resp.json().catch(() => ({}));
+    let chs = [];
+    if (data.js?.data) {
+        const raw = data.js.data;
+        if (Array.isArray(raw)) chs = raw;
+        else chs = Object.values(raw);
+    }
+    return chs;
 }
 
 async function genToken() {
-    await generateHardwareVersions();
-    const token = await getToken();
-    if (!token) return { token:'', profile:{}, account_info:{} };
-    const profile = await auth(token);
-    let newToken = await handShake(token) || token;
-    const account_info = await getAccountInfo(newToken);
-    return { token: newToken, profile, account_info };
+    await generateHardware();
+    cachedToken = await getToken();
+    cachedProfile = await auth(cachedToken);
+    cachedToken = await handShake(cachedToken) || cachedToken;
+    cachedAccount = await getAccountInfo(cachedToken);
+    cachedGenres = await getGenres(cachedToken);
+    cachedChannels = await getChannels(cachedToken);
 }
 
-// ==================== HTTP SERVER ====================
-async function convertJsonToM3U(channels, profile, account_info, request) {
-    let m3u = ['#EXTM3U', `# Total Channels => ${channels.length}`, '# Script => @tg_aadi',''];
-    const origin = `http://localhost:8080`;
-
-    channels.forEach((ch,i) => {
-        const real_cmd = (ch.cmd || `unknown`).replace(/ffrt\s+http:\/\/localhost\/ch\//i,'').trim();
-        m3u.push(`#EXTINF:-1 tvg-name="${ch.name}" tvg-id="${ch.tvgid}" group-title="${ch.title}",${ch.name}`);
-        m3u.push(`${origin}/${real_cmd}.m3u8`);
-        if(i<5) logDebug(`M3U Channel #${i}: ${ch.name} -> ${origin}/${real_cmd}.m3u8`);
+// ----------------------- M3U Generation -----------------------
+function generateM3U(origin) {
+    const m3u = ['#EXTM3U', `# Total Channels => ${cachedChannels.length}`, ''];
+    cachedChannels.forEach((ch, i) => {
+        const logo = ch.logo ? `http://${config.host}/stalker_portal/misc/logos/320/${ch.logo}` : '';
+        const title = cachedGenres.find(g => g.id === ch.tv_genre_id)?.title || 'Other';
+        const stream = `${origin}/${ch.cmd.replace(/^ffrt\s+http:\/\/localhost\/ch\//i, '')}.m3u8`;
+        m3u.push(`#EXTINF:-1 tvg-id="${ch.xmltv_id}" tvg-name="${ch.name}" tvg-logo="${logo}" group-title="${title}",${ch.name}`);
+        m3u.push(stream);
     });
     return m3u.join('\n');
 }
 
-async function handleRequest(req, res) {
-    try {
-        const url = new URL(req.url, `http://${req.headers.host}`);
-        const pathParts = url.pathname.split('/');
-        const lastPart = pathParts[pathParts.length-1];
+// ----------------------- Auto-refresh -----------------------
+setInterval(async () => { logDebug('Refreshing token & profile'); await genToken(); }, 15 * 60 * 1000);
+setInterval(async () => { if(cachedToken) cachedChannels = await getChannels(cachedToken); }, 10 * 60 * 1000);
 
-        const { token, profile, account_info } = await genToken();
-        if(!token) return res.end('Token generation failed');
+// ----------------------- Localhost Server -----------------------
+const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathParts = url.pathname.split('/');
+    const lastPart = pathParts[pathParts.length - 1];
 
-        if(url.pathname === '/playlist.m3u8') {
-            const channelsUrl = `http://${config.host}/stalker_portal/server/load.php?type=itv&action=get_all_channels&JsHttpRequest=1-xml`;
-            const resp = await fetchWithBackoff(channelsUrl,{ headers:getHeaders(token)});
-            const data = await safeJSONFromResponse(resp,'get_all_channels');
-            let channels = [];
-            if(data.js?.data) channels = Array.isArray(data.js.data)?data.js.data:Object.values(data.js.data);
-            const genres = await getGenres(token);
-            const groupTitleMap = {};
-            (genres||[]).forEach(g=>{if(g?.id!==undefined)groupTitleMap[g.id]=g.title||'Other'});
-            channels = channels.map(ch=>({...ch,title:groupTitleMap[ch.tv_genre_id]||'Other'}));
-            const m3u = await convertJsonToM3U(channels, profile, account_info, req);
-            res.writeHead(200,{'Content-Type':'application/vnd.apple.mpegurl'});
-            return res.end(m3u);
-        }
+    if (url.pathname === '/playlist.m3u8') {
+        const m3u = generateM3U(`http://${req.headers.host}`);
+        res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+        res.end(m3u);
+        return;
+    }
 
-        if(lastPart.endsWith('.m3u8') && lastPart!=='playlist.m3u8') {
-            const id = lastPart.replace(/\.m3u8$/,'');
-            const stream = await getStreamURL(id, token);
-            if(!stream){ res.writeHead(500); return res.end('No stream'); }
-            res.writeHead(302,{Location: stream});
-            return res.end();
-        }
+    if (lastPart.endsWith('.m3u8') && lastPart !== 'playlist.m3u8') {
+        const id = lastPart.replace(/\.m3u8$/, '');
+        const ch = cachedChannels.find(c => c.cmd.includes(id));
+        if (!ch) { res.writeHead(404); res.end('Channel not found'); return; }
+        // Simulate redirect to original cmd URL
+        const stream = ch.cmd.replace(/^ffrt\s+http:\/\/localhost\/ch\//i, '');
+        res.writeHead(302, { 'Location': stream });
+        res.end();
+        return;
+    }
 
-        res.writeHead(404); res.end('Not Found');
-    } catch(e){ logDebug(`Unexpected error: ${e.message}`); res.writeHead(500); res.end('Internal Server Error'); }
-}
+    res.writeHead(404);
+    res.end('Not Found');
+});
 
-const server = http.createServer(handleRequest);
-server.listen(8080,()=>logDebug('Server running at http://localhost:8080'));
+server.listen(8080, async () => {
+    await genToken(); // initial fetch
+    logDebug('Server running at http://localhost:8080');
+});
