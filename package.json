@@ -1,7 +1,7 @@
 {
   "name": "stalker-termux",
   "version": "1.0.0",
-  "type": "module",
-  "dependencies": { "node-fetch": "^3.3.2" },
-  "scripts": { "start": "node worker.js" }
+  "type": "commonjs",
+  "dependencies": { "node-fetch": "^2.6.12" },
+  "scripts": { "start": "node worker.cjs" }
 }
