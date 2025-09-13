@@ -1,0 +1,10 @@
+{
+  "name": "stalker-worker",
+  "version": "1.0.0",
+  "description": "Stalker Portal M3U Generator for Termux",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {}
+}
